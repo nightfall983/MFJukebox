@@ -1,7 +1,7 @@
 package com.ketonax.server;
 
+import java.net.SocketAddress;
 import java.nio.charset.Charset;
-
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -24,14 +24,21 @@ import edu.rutgers.winlab.jmfapi.MFFlag;
 
 public class MFServer {
 
-	/* Used to store a mapping of station GUID and the station object. */
-	static Map<String, MFStation> stationMap = null;
+	/* Used to store a mapping of station name and the station object. */
+	private static Map<String, MFStation> stationMap = null;
 
 	/* Used to store a mapping of userGUID and the user's current station. */
-	static Map<GUID, MFStation> currentStationMap = null;
+	private static Map<GUID, MFStation> currentStationMap = null;
 
-	static List<MFStation> stationList = null;
-	static ArrayList<GUID> allUsers = null;
+	private static List<MFStation> stationList = null;
+	private static ArrayList<GUID> allUsers = null;
+	private static Map<GUID, Boolean> pingResponseMap = null;
+	private static Map<GUID, Integer> latencyMap = null;
+	private static Map<GUID, Integer> pingCountMap = null;
+	private static Map<GUID, ArrayList<Integer>> latencySampleSizeMap = null;
+	private static int totalPingSampleSize = 100;
+	private static int latencyTime = 0; // Milliseconds
+	private static boolean pingStarted = false;
 
 	/* Networking */
 	static GUID SERVER_GUID;
