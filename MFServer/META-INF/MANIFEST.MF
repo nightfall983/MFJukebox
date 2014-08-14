@@ -1,0 +1,5 @@
+Manifest-Version: 1.0
+Class-Path: . MFServer_lib/jmfapi-1.0-SNAPSHOT.jar MFServer_lib/jgnrs-
+ 1.0-SNAPSHOT.jar
+Main-Class: com.ketonax.server.MFServer
+
