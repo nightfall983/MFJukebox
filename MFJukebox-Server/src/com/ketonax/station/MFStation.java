@@ -1,14 +1,15 @@
 package com.ketonax.station;
 
 import java.io.IOException;
-import java.util.Iterator;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import com.ketonax.constants.MFNetworking;
-import com.ketonax.networking.MessageBuilder;
 import com.ketonax.networking.NamingService;
 
 import edu.rutgers.winlab.jgnrs.JGNRS;
@@ -22,12 +23,17 @@ public class MFStation implements Runnable {
 	private GUID stationGUID;
 
 	private Queue<GUID> userList = null;
-	private Queue<GUID> songQueue = null;
-	private Queue<GUID> songsPlayedQueue = null;
-	private Map<GUID, Integer> songLengthMap = null;
-	private Map<GUID, GUID> songSourceMap = null;
-	private Map<String, GUID> songIDMap = null;
+	private Queue<String> songQueue = null;
+	private Queue<String> songsPlayedQueue = null;
+	private Map<String, Integer> songLengthMap = null;
+	private Map<String, GUID> songSourceMap = null;
+	private Map<String, Integer> songDownloadedMap = null;
+	private Map<GUID, Integer> latencyMap = null;
 
+	private boolean isPlaying = false;
+	private String currentSong = null;
+	private int trackPosition = 0;
+	private int playSongTimeout = 30; // Seconds
 	private boolean stopRunning = false;
 
 	/* Networking */
@@ -42,14 +48,24 @@ public class MFStation implements Runnable {
 		this.serverSocket = serverSocket;
 		stationGUID = NamingService.assignGUID();
 		userList = new ConcurrentLinkedQueue<GUID>();
-		songQueue = new ConcurrentLinkedQueue<GUID>();
-		songsPlayedQueue = new ConcurrentLinkedQueue<GUID>();
-		songLengthMap = new ConcurrentHashMap<GUID, Integer>();
-		songSourceMap = new ConcurrentHashMap<GUID, GUID>();
-		songIDMap = new ConcurrentHashMap<String, GUID>();
+		songQueue = new ConcurrentLinkedQueue<String>();
+		songsPlayedQueue = new ConcurrentLinkedQueue<String>();
+		songLengthMap = new ConcurrentHashMap<String, Integer>();
+		songSourceMap = new ConcurrentHashMap<String, GUID>();
+		songDownloadedMap = new ConcurrentHashMap<String, Integer>();
+		latencyMap = new HashMap<GUID, Integer>();
 
 		/* Setup gnrs */
 		this.gnrs = gnrs;
+
+		try {
+			addUser(creator);
+			log("Station is running.");
+			log("User at " + creator.getGUID() + " has created station: "
+					+ stationName);
+		} catch (StationException e) {
+			e.printStackTrace();
+		}
 	}
 
 	public void run() {
@@ -64,13 +80,20 @@ public class MFStation implements Runnable {
 				halt();
 			}
 
-			Iterator<GUID> it = songQueue.iterator();
+			if (isPlaying == false && !songQueue.isEmpty()) {
+				currentSong = songQueue.element();
 
-			while (it.hasNext() && !userList.isEmpty()) {
-				GUID song = it.next();
 				try {
-					Thread.sleep(1000); /* Not sure why, but fixes songLengthMap */
-					playSong(song);
+					/* Wait for 1 second, then play the next song */
+					Thread.sleep(1000);
+
+					/*
+					 * Wait for notification from users that song has been
+					 * downloaded or timeout has occured.
+					 */
+					preparePlayback();
+					playSong(currentSong);
+					songsPlayedQueue.add(currentSong);
 				} catch (StationException e) {
 					e.printStackTrace();
 				} catch (IOException e) {
@@ -78,12 +101,6 @@ public class MFStation implements Runnable {
 				} catch (InterruptedException e) {
 					e.printStackTrace();
 				}
-
-				songsPlayedQueue.add(song);
-				songRemovedNotifier(song);
-				log("The song \"" + song
-						+ "\" has been removed from station queue");
-				it.remove();
 			}
 		}
 
@@ -130,8 +147,36 @@ public class MFStation implements Runnable {
 
 			try {
 				sendPlaylist(userGUID);
+				sendUserList(userGUID);
 			} catch (IOException e) {
 				e.printStackTrace();
+			}
+
+			String notification = MFNetworking.buildUserAddedNotifier(
+					stationName, userGUID);
+			// sendMulticastMessage(notification);
+			sendToAll(notification);
+
+			/*
+			 * If user is added while the current song is playing tell song
+			 * holder to send the song to the user.
+			 */
+			if (isPlaying) {
+				GUID songHolder = getSongSource(currentSong);
+				if (songHolder != userGUID) {
+					String sendSongCommand = MFNetworking
+							.buildSendSongToUserCommand(stationName,
+									currentSong, userGUID);
+					sendToUser(sendSongCommand, songHolder);
+				} else {
+					try {
+						playSongCatchUp(currentSong, userGUID);
+					} catch (IOException e) {
+						e.printStackTrace();
+					} catch (InterruptedException e) {
+						e.printStackTrace();
+					}
+				}
 			}
 		} else
 			throw new StationException("User is already on the list");
@@ -149,13 +194,12 @@ public class MFStation implements Runnable {
 					+ ") is not on station (Station Name: " + stationName
 					+ ") list.");
 		userList.remove(userGUID);
+		latencyMap.remove(userGUID);
 
 		updateGNRS(); // Update gnrs with userList changes
 
-		String[] elements = { MFNetworking.USER_REMOVED_NOTIFIER, stationName,
-				Integer.toString(userGUID.getGUID()) };
-		String notification = MessageBuilder.buildMessage(elements,
-				MFNetworking.SEPERATOR);
+		String notification = MFNetworking.buildUserRemovedNotifier(
+				stationName, userGUID);
 		sendToAll(notification);
 		log("User at " + userGUID + " has been removed.");
 	}
@@ -174,53 +218,60 @@ public class MFStation implements Runnable {
 					+ ") is not part of this station (Station Name: "
 					+ stationName + ").");
 
-		if (songIDMap.containsKey(songName))
+		if (songQueue.contains(songName))
 			throw new StationException("Song (Song Name: " + songName
 					+ ") is already on this station (Station Name: "
 					+ stationName + ") playlist.");
-		
-		GUID songGUID = NamingService.assignGUID();
 
-		songQueue.add(songGUID);
-		songSourceMap.put(songGUID, userGUID);
-		songIDMap.put(songName, songGUID);
-		songLengthMap.put(songGUID, songLength);
+		songQueue.add(songName);
+		songSourceMap.put(songName, userGUID);
+		songLengthMap.put(songName, songLength);
 
-		String notification = MFNetworking.SONG_ADDED_NOTIFIER + ","
-				+ stationName + "," + songGUID;
+		String notification = MFNetworking.buildSongAddedNotifier(stationName,
+				songName);
 		sendToAll(notification);
-		log(songGUID + " has been added to the station.");
+
+		log("\"" + songName + "\" has been added to the station by user at "
+				+ userGUID.getGUID() + "." + " Songs on queue = "
+				+ songQueue.size());
+
+		/* Tell the user to send the song to other devices */
+		String command = MFNetworking.buildSendSongCommand(stationName,
+				songName);
+		sendToUser(command, userGUID);
+
+		log("Instructed user at address \"" + userGUID.getGUID()
+				+ "\" to send \"" + currentSong + "\" to station users.");
 	}
 
-	public void removeSong(GUID songGUID) throws StationException {
+	public void removeSong(String songName) throws StationException {
 		/** This function removes songGUID from all lists and maps that hold it. */
 
-		if (!songQueue.contains(songGUID))
-			throw new StationException("In removeSong(), " + songGUID
+		if (!songQueue.contains(songName))
+			throw new StationException("In removeSong(), " + songName
 					+ " is not on songQueue");
 
-		if (!songSourceMap.containsKey(songGUID))
-			throw new StationException("In removeSong(), " + songGUID
+		if (!songSourceMap.containsKey(songName))
+			throw new StationException("In removeSong(), " + songName
 					+ " is not on songSourceMap");
 
-		if (!songLengthMap.containsKey(songGUID))
-			throw new StationException("In removeSong(), " + songGUID
+		if (!songLengthMap.containsKey(songName))
+			throw new StationException("In removeSong(), " + songName
 					+ " is not on songLengthMap");
 
-		songQueue.remove(songGUID);
-		songSourceMap.remove(songGUID);
-		songLengthMap.remove(songGUID);
+		songQueue.remove(songName);
+		// songSourceMap.remove(songGUID);
+		// songLengthMap.remove(songGUID);
 
 		/* Build message and send */
-		String[] elements = { MFNetworking.SONG_REMOVED_NOTIFIER, stationName,
-				Integer.toString(songGUID.getGUID()) };
-		String notification = MessageBuilder.buildMessage(elements,
-				MFNetworking.SEPERATOR);
+		String notification = MFNetworking.buildSongRemovedNotifier(
+				stationName, songName);
 		sendToAll(notification);
-		log(songGUID + " has been removed from the station");
+		log(songName + " has been removed from the station"
+				+ " Songs on queue = " + songQueue.size());
 	}
 
-	public GUID getSongSource(GUID song) throws StationException {
+	public GUID getSongSource(String song) throws StationException {
 		/** Returns the socket address of the user device holding the given song */
 
 		if (!songSourceMap.containsKey(song))
@@ -230,7 +281,7 @@ public class MFStation implements Runnable {
 		return songSourceMap.get(song);
 	}
 
-	public int getSongLength(GUID song) throws StationException {
+	public int getSongLength(String song) throws StationException {
 		/** Returns the song length in milliseconds */
 
 		if (!songLengthMap.containsKey(song))
@@ -240,64 +291,125 @@ public class MFStation implements Runnable {
 		return songLengthMap.get(song);
 	}
 
+	public void latencyUpdate(GUID userID, int latency) {
+		latencyMap.put(userID, latency);
+		// log(Integer.toString(latency)); // TODO test
+	}
+
+	private void preparePlayback() {
+		/**
+		 * This method checks to see that the current song is ready to play. It
+		 * checks to see that the number of times the song has been downloaded
+		 * matches the userList size.
+		 */
+
+		// log("readyToPlay started. Checking for " + currentSong); // TODO test
+
+		if (isPlaying == false) {
+
+			int i = 0;
+			while (i < playSongTimeout) {
+				try {
+					int downloadCount = songDownloadedMap.get(currentSong);
+					// log(Integer.toString(downloadCount)); //TODO Test
+					if (downloadCount == userList.size() - 1)
+						break;
+					Thread.sleep(1000);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+				i++;
+			}
+			// log("readyToPlay stopped."); // TODO test
+		}
+	}
+
+	public boolean songIsPlaying() {
+		return isPlaying;
+	}
+
+	public void resetTrackPosition() {
+		trackPosition = 0;
+	}
+
+	public void startPlaybackTimer() throws StationException,
+			InterruptedException {
+
+		if (!songLengthMap.containsKey(currentSong))
+			throw new StationException(
+					"No song length information for the current song \""
+							+ currentSong + "\"");
+
+		resetTrackPosition();
+		final int songLength = getSongLength(currentSong);
+		isPlaying = true;
+
+		final Timer timer = new Timer();
+		// log("Playback timer started."); TODO test
+		timer.scheduleAtFixedRate(new TimerTask() {
+			public void run() {
+				++trackPosition;
+				if (trackPosition == songLength) {
+					timer.cancel();
+					isPlaying = false;
+
+					log("playback timer stopped");
+				}
+			}
+		}, 0, 1);
+		// removeSong(currentSong); //TODO
+		// log("playback timer stopped.");
+	}
+
 	/* Networking dependent functions */
+
+	private void updateGNRS() {
+		/**
+		 * This method updates the gnrs with the network addresses associated
+		 * with this station
+		 */
+
+		int[] nas = new int[userList.size()];
+		int i = 0;
+		for (GUID user : userList) {
+			nas[i] = user.getGUID();
+			i++;
+		}
+		gnrs.add(stationGUID.getGUID(), nas);
+	}
+
 	public void userAddedNotifier(GUID addeduserGUID) {
 		/**
 		 * This function notifies all devices that a new user has been added. It
 		 * sends the socket address of the user to the devices.
 		 */
 
-		String[] elements = { MFNetworking.USER_ADDED_NOTIFIER, stationName,
-				Integer.toString(addeduserGUID.getGUID()) };
-		String notification = MessageBuilder.buildMessage(elements,
-				MFNetworking.SEPERATOR);
+		String notification = MFNetworking.buildUserAddedNotifier(stationName,
+				addeduserGUID);
 		sendToAll(notification);
 		log("User at " + addeduserGUID + " has been added to the station");
 	}
 
-	public void songAddedNotifier(GUID songGUID) {
+	public void songAddedNotifier(String songName) {
 		/**
 		 * This function notifies all devices that a new song has been added to
 		 * the queue.
 		 */
 
-		String[] elements = { MFNetworking.SONG_ADDED_NOTIFIER,
-				Integer.toString(songGUID.getGUID()) };
-		String notification = MessageBuilder.buildMessage(elements,
-				MFNetworking.SEPERATOR);
+		String notification = MFNetworking.buildSongAddedNotifier(stationName,
+				songName);
 		sendToAll(notification);
 	}
 
-	public void songRemovedNotifier(GUID song) {
+	public void songRemovedNotifier(String songName) {
 		/**
 		 * This function notifies all devices that a new song has been removed
 		 * to the queue.
 		 */
 
-		String[] elements = { MFNetworking.SONG_REMOVED_NOTIFIER,
-				Integer.toString(song.getGUID()) };
-		String notification = MessageBuilder.buildMessage(elements,
-				MFNetworking.SEPERATOR);
+		String notification = MFNetworking.buildSongRemovedNotifier(
+				stationName, songName);
 		sendToAll(notification);
-	}
-
-	public void sendPlaylist(GUID userGUID) throws IOException {
-		/**
-		 * This function sends each song on the playlist to a user. This
-		 * function should only be used if the playlist is explicitly requested
-		 * by a user. Station should default to notifying a device each time a
-		 * song is added.
-		 */
-
-		String data = null;
-		for (GUID s : songQueue) {
-			String[] elements = { MFNetworking.SONG_ON_LIST_RESPONSE,
-					stationName, Integer.toString(s.getGUID()) };
-			data = MessageBuilder.buildMessage(elements, MFNetworking.SEPERATOR);
-			sendToUser(data, userGUID);
-		}
-
-		log("Songs on station queue have been sent to the user at " + userGUID);
 	}
 
 	public void sendUserList(GUID userGUID) throws IOException {
@@ -310,14 +422,68 @@ public class MFStation implements Runnable {
 
 		String data = null;
 		for (GUID user : userList) {
-			String[] elements = { MFNetworking.USER_ON_LIST_RESPONSE,
-					stationName, Integer.toString(user.getGUID()) };
-			data = MessageBuilder.buildMessage(elements, MFNetworking.SEPERATOR);
+			data = MFNetworking.buildUserOnListResponse(stationName, user);
 			sendToUser(data, userGUID);
 		}
 
 		log("Socket address of users on station user list have been sent to the user at "
 				+ userGUID);
+	}
+
+	public void sendPlaylist(GUID userGUID) throws IOException,
+			StationException {
+		/**
+		 * This function sends each song on the playlist to a user. This
+		 * function should only be used if the playlist is explicitly requested
+		 * by a user. Station should default to notifying a device each time a
+		 * song is added.
+		 */
+
+		String data = null;
+		for (String songName : songQueue) {
+			data = MFNetworking.buildSongOnListResponse(stationName, songName);
+			sendToUser(data, userGUID);
+
+			/*
+			 * If user is added while the current song is playing tell song
+			 * holder to send the song to the user.
+			 */
+			if (isPlaying) {
+				if (songName.equals(currentSong))
+					continue;
+
+				GUID songHolder = getSongSource(songName);
+				if (songHolder != userGUID) {
+					String sendSongCommand = MFNetworking
+							.buildSendSongToUserCommand(stationName, songName,
+									userGUID);
+					sendToUser(sendSongCommand, songHolder);
+				}
+			}
+
+			log("Songs on station queue have been sent to the user at "
+					+ userGUID);
+		}
+	}
+
+	public void notifyDownloaded(GUID userID, String songName) {
+
+		log("User at \"" + userID.getGUID() + "\" has finished downloading "
+				+ songName + ".");
+		try {
+			if (isPlaying == true && songName.equals(currentSong)) {
+				playSongCatchUp(currentSong, userID);
+			} else {
+				int currentDownloadCount = songDownloadedMap.get(songName);
+				songDownloadedMap.put(songName, ++currentDownloadCount);
+			}
+		} catch (StationException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}
 	}
 
 	public void sendToUser(String message, GUID userGUID) {
@@ -340,56 +506,82 @@ public class MFStation implements Runnable {
 
 	/* Private Methods */
 
-	private void playSong(GUID song) throws StationException, IOException,
-			InterruptedException {
+	private void playSong(String songName) throws StationException,
+			IOException, InterruptedException {
 		/* Establish a socket connection and play song with GUID songGUID */
 
 		// Check to see if song is on songSourceMap
-		if (!songSourceMap.containsKey(song))
-			throw new StationException("In function playSong(), \"" + song
+		if (!songSourceMap.containsKey(songName))
+			throw new StationException("In function playSong(), \"" + songName
 					+ "\" is not on songSourceMap.");
 
-		int songLength = getSongLength(song);
-		GUID songSource = getSongSource(song);
-
-		/* Send command to device to play song */
-		String[] commandElements = { MFNetworking.PLAY_SONG_CMD,
-				Integer.toString(song.getGUID()) };
-		String command = MessageBuilder.buildMessage(commandElements,
-				MFNetworking.SEPERATOR);
-		sendToUser(command, songSource);
-
-		/* Send notification to all devices of current song playing */
-		String[] notificationElements = {
-				MFNetworking.CURRENTLY_PLAYING_NOTIFIER, stationName,
-				Integer.toString(song.getGUID()),
-				Integer.toString(songSource.getGUID()) };
-		String notification = MessageBuilder.buildMessage(notificationElements,
-				MFNetworking.SEPERATOR);
-		sendToAll(notification);
-
+		notifyCurrentlyPlaying();
 		/* Display station queue status */
-		log("Instructed user at \"" + songSource.getGUID() + "\" to play \""
-				+ song + "\". Song length = " + songLengthMap.get(song)
+		log("Instructed station users " + "to play \"" + songName
+				+ "\". Song length = " + songLengthMap.get(songName)
 				+ "ms. Songs played = " + songsPlayedQueue.size()
 				+ ". Songs on queue = " + songQueue.size());
 
-		Thread.sleep(songLength);
+		startPlaybackTimer();
+		Thread.sleep(getSongLength(currentSong));
+		removeSong(currentSong);
 	}
 
-	private void updateGNRS() {
+	private void notifyCurrentlyPlaying() {
+		GUID songSource = songSourceMap.get(currentSong);
+
+		for (GUID user : userList) {
+
+			int userLatency = 0;
+			if (latencyMap.containsKey(user))
+				userLatency = latencyMap.get(user);
+			int startPosition = 0;
+
+			/* Send notification to all devices of current song playing */
+			String notification = MFNetworking.buildCurrentlyPlayingNotifier(
+					stationName, currentSong, songSource,
+					Integer.toString(startPosition + userLatency));
+			sendToUser(notification, user);
+		}
+	}
+
+	@SuppressWarnings("unused")
+	private void playSongCatchUp(String songName, GUID userID)
+			throws StationException, IOException, InterruptedException {
 		/**
-		 * This method updates the gnrs with the network addresses associated
-		 * with this station
+		 * Establish a socket connection and tells a specific user to play song
+		 * at the current trackPosition
 		 */
 
-		int[] nas = new int[userList.size()];
-		int i = 0;
-		for (GUID user : userList) {
-			nas[i] = user.getGUID();
-			i++;
-		}
-		gnrs.add(stationGUID.getGUID(), nas);
+		// Check to see if song is on songSourceMap
+		if (!songSourceMap.containsKey(songName))
+			throw new StationException("In function playSongCatchUp(), \""
+					+ songName + "\" is not on songSourceMap.");
+
+		int songLength = getSongLength(songName);
+		GUID songSource = getSongSource(songName);
+
+		/* Send notification to a devices about current song playing */
+		int userLatency = 0;
+		if (latencyMap.containsKey(userID))
+			userLatency = latencyMap.get(userID);
+		else
+			log("Latency map doesn't contain address: " + userID.getGUID());
+
+		int startPosition = trackPosition;
+		String notification = MFNetworking.buildCurrentlyPlayingNotifier(
+				stationName, songName, songSource,
+				Integer.toString(startPosition + userLatency));
+		// sendMulticastMessage(notification);
+		sendToUser(notification, userID);
+
+		/* Display station queue status */
+		log("Instructed user at address \"" + userID.getGUID()
+				+ "\" to play \"" + songName + "\". Start position = "
+				+ startPosition + ". Latency factor = " + userLatency
+				+ ". Song length = " + songLengthMap.get(songName)
+				+ "ms. Songs played = " + songsPlayedQueue.size()
+				+ ". Songs on queue = " + songQueue.size());
 	}
 
 	private void log(String message) {

@@ -1,4 +1,4 @@
-package com.ketonax.networking;
+package com.ketonax.server;
 
 public class ServerException extends Exception {
 	
